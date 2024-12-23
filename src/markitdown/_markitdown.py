@@ -9,10 +9,13 @@ import os
 import re
 import shutil
 import subprocess
-import sys
 import tempfile
 import traceback
 import zipfile
+import uuid
+import fitz  # PyMuPDF: 用于处理PDF中的图像和其他复杂内容
+# from pdfminer.high_level import extract_text  # pdfminer.six: 用于从PDF中提取文本
+# from typing import Union, Dict, Any, List, Tuple  # 提供类型提示，帮助提高代码可读性和维护性
 from xml.dom import minidom
 from typing import Any, Dict, List, Optional, Union
 from pathlib import Path
@@ -22,8 +25,6 @@ from warnings import warn, resetwarnings, catch_warnings
 import mammoth
 import markdownify
 import pandas as pd
-import pdfminer
-import pdfminer.high_level
 import pptx
 
 # File-format detection
@@ -680,15 +681,137 @@ class PdfConverter(DocumentConverter):
     """
 
     def convert(self, local_path, **kwargs) -> Union[None, DocumentConverterResult]:
+        llm_client= kwargs.get("llm_client", None)
+        llm_model = kwargs.get("llm_model", None)
+        llm_prompt = kwargs.get("llm_prompt", None)
+        customMammothCoverImage = CustomMammothCoverImage(llm_client, llm_model, llm_prompt, 'pdf')
+
         # Bail if not a PDF
         extension = kwargs.get("file_extension", "")
         if extension.lower() != ".pdf":
             return None
 
+        # 使用 PyMuPDF 打开指定路径的 PDF 文件
+        doc = fitz.open(local_path)
+        content_items = []
+
+        # 遍历 PDF 文件中的每一页
+        for page_num in range(len(doc)):
+            page_content = []
+            # 加载当前页的内容
+            page = doc.load_page(page_num)
+
+            # 提取带有位置信息的文本块
+            text_blocks = page.get_text("blocks")
+            # 提取页面上的所有图像对象，并获取它们的边界框信息
+            image_list = page.get_images(full=True)
+
+            # 收集文本项
+            for tb in text_blocks:
+                rect = (tb[0], tb[1], tb[2], tb[3])  # Text block rectangle
+                page_content.append({
+                    'type': 'text',
+                    'content': tb[4],   # 文本内容
+                    'rect': rect    # 文本块的位置信息
+                })
+
+            # 收集图像项
+            for img_index, img in enumerate(image_list):
+                xref = img[0]
+                base_image = doc.extract_image(xref)
+                image_bytes = base_image["image"]
+                image_ext = base_image["ext"]
+                # 调用豆包识别图片信息
+                result = customMammothCoverImage.mammoth_convert_image(base_image)
+
+                # Approximate the image's position using its bounding box
+                image_rect = page.get_image_bbox(img)
+                page_content.append({
+                    'type': 'image',
+                    'content': '![' + result['alt'] + ']()',
+                    'rect': image_rect  # 获取图像的大致位置
+                })
+
+            # 根据内容项在页面上的垂直位置（y坐标），然后是水平位置（x坐标）对它们进行排序
+            page_content.sort(key=lambda item: (item['rect'][1], item['rect'][0]))
+            content_items.extend(page_content)
+
+        # 遍历排好序的内容项,只要content
+        str = ""
+        for info in content_items:
+            str = str + info["content"]
+
         return DocumentConverterResult(
             title=None,
-            text_content=pdfminer.high_level.extract_text(local_path),
+            text_content=str,
+            # text_content=pdfminer.high_level.extract_text(local_path),
         )
+
+
+
+
+class CustomMammothCoverImage:
+  def __init__(self,llm_client: Optional[Any] = None,llm_model: Optional[str] = None,llm_prompt: Optional[str] = None,type: Optional[str] = None,kbId: Optional[str] = None):
+        self.llm_client=llm_client
+        self.llm_model = llm_model
+        self.llm_prompt = llm_prompt
+        self.type = type
+        self.custom_image_converter = mammoth.images.img_element(self.mammoth_convert_image)
+        self.mdImage = MarkItDown(llm_client=llm_client, llm_model=llm_model)
+
+  def mammoth_convert_image(self, image):
+        output_dir = "./static/temp"
+        # 确保输出目录存在
+        os.makedirs(output_dir, exist_ok=True)
+
+        # 获取文件后缀
+        if self.type == 'docx' or self.type == 'pptx':
+            content_type = image.content_type.lower()
+        elif self.type == 'pdf':
+            content_type = image["ext"].lower()
+
+        # 根据 content_type 创建合适的文件扩展名
+        if "png" in content_type:
+            extension = ".png"
+        elif "jpeg" in content_type or "jpg" in content_type:
+            extension = ".jpg"
+        else:
+            extension = ".bin"  # 如果类型未知，使用 .bin 扩展名
+
+        # 构造唯一的文件名，避免覆盖已有的文件
+        # 图片名称: uuid + 后缀
+        imageName = uuid.uuid4().hex + extension
+        filename = os.path.join(output_dir, imageName)
+        i = 1
+        while os.path.exists(filename):
+            filename = os.path.join(output_dir, f"image_{i}{extension}")
+            i += 1
+
+        # 打开图像并写入文件
+        if self.type == 'docx':
+            # doc
+            with image.open() as image_bytes:
+                with open(filename, 'wb') as file:
+                    file.write(image_bytes.read())
+        elif self.type == 'pptx':
+            # ppt
+            with open(filename, 'wb') as f:
+                f.write(image.blob)
+        elif self.type == 'pdf':
+            # pdf
+            with open(filename, 'wb') as f:
+                f.write(image["image"])
+
+        result = self.mdImage.convert(filename,llm_prompt=self.llm_prompt)
+        #print(self.llm_client)
+        # 最后删除这个图片
+        os.remove(filename)
+        return {
+            "alt": result.text_content
+        }
+
+
+
 
 
 class DocxConverter(HtmlConverter):
@@ -697,6 +820,11 @@ class DocxConverter(HtmlConverter):
     """
 
     def convert(self, local_path, **kwargs) -> Union[None, DocumentConverterResult]:
+
+        llm_client= kwargs.get("llm_client", None)
+        llm_model = kwargs.get("llm_model", None)
+        llm_prompt = kwargs.get("llm_prompt", None)
+        customMammothCoverImage= CustomMammothCoverImage(llm_client,llm_model,llm_prompt,'docx')
         # Bail if not a DOCX
         extension = kwargs.get("file_extension", "")
         if extension.lower() != ".docx":
@@ -705,8 +833,7 @@ class DocxConverter(HtmlConverter):
         result = None
         with open(local_path, "rb") as docx_file:
             style_map = kwargs.get("style_map", None)
-
-            result = mammoth.convert_to_html(docx_file, style_map=style_map)
+            result = mammoth.convert_to_html(docx_file, style_map=style_map,convert_image=customMammothCoverImage.custom_image_converter)
             html_content = result.value
             result = self._convert(html_content)
 
@@ -743,6 +870,11 @@ class PptxConverter(HtmlConverter):
     """
 
     def convert(self, local_path, **kwargs) -> Union[None, DocumentConverterResult]:
+        llm_client= kwargs.get("llm_client", None)
+        llm_model = kwargs.get("llm_model", None)
+        llm_prompt = kwargs.get("llm_prompt", None)
+        customMammothCoverImage = CustomMammothCoverImage(llm_client, llm_model, llm_prompt, 'pptx')
+
         # Bail if not a PPTX
         extension = kwargs.get("file_extension", "")
         if extension.lower() != ".pptx":
@@ -767,14 +899,22 @@ class PptxConverter(HtmlConverter):
                         alt_text = shape._element._nvXxPr.cNvPr.attrib.get("descr", "")
                     except Exception:
                         pass
+                    # print(shape.image)
+                    result = customMammothCoverImage.mammoth_convert_image(shape.image)
 
                     # A placeholder name
                     filename = re.sub(r"\W", "", shape.name) + ".jpg"
+                    # md_content += (
+                    #     "\n!["
+                    #     + (alt_text if alt_text else shape.name)
+                    #     + "]("
+                    #     + filename
+                    #     + ")\n"
+                    # )
                     md_content += (
                         "\n!["
-                        + (alt_text if alt_text else shape.name)
+                        + result['alt']
                         + "]("
-                        + filename
                         + ")\n"
                     )
 
